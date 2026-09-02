@@ -1,0 +1,21 @@
+menu "ESP Time-Series Recorder"
+
+    config ESP_TIMESERIES_RECORDER_BUFFER_KIB
+        int "Internal DRAM buffer size (KiB)"
+        range 16 256
+        default 128
+        help
+            Statically reserve this many KiB of contiguous internal DRAM for
+            interleaved signed 16-bit samples. The buffer is volatile and is
+            not placed in flash or external PSRAM.
+
+    config ESP_TIMESERIES_RECORDER_MAX_CHANNELS
+        int "Maximum number of channels"
+        range 1 32
+        default 16
+        help
+            Maximum number of signed 16-bit variables in one sample record.
+            The actual channel count is selected when the recorder is
+            initialized and determines the capture duration.
+
+endmenu
