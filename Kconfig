@@ -7,7 +7,12 @@ menu "ESP Time-Series Recorder"
         help
             Statically reserve this many KiB of contiguous internal DRAM for
             interleaved signed 16-bit samples. The buffer is volatile and is
-            not placed in flash or external PSRAM.
+            not placed in flash or external PSRAM. This complete amount is a
+            compile-time RAM cost even while the recorder is EMPTY.
+
+            Capacity is floor(buffer_bytes / (2 * runtime_channel_count)).
+            Increasing the sample rate shortens capture duration but does not
+            alter the number of records that fit.
 
     config ESP_TIMESERIES_RECORDER_MAX_CHANNELS
         int "Maximum number of channels"
@@ -16,6 +21,8 @@ menu "ESP Time-Series Recorder"
         help
             Maximum number of signed 16-bit variables in one sample record.
             The actual channel count is selected when the recorder is
-            initialized and determines the capture duration.
+            initialized and determines the capture duration. This limit also
+            sizes the small per-channel invalid and saturation counter arrays;
+            it does not multiply the main sample-buffer reservation.
 
 endmenu

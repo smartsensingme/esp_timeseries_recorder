@@ -26,16 +26,33 @@ static uint32_t recorder_capture_id;
 static uint32_t producer_calls_until_sample;
 static int64_t recorder_start_time_us;
 
+/**
+ * @brief Calculate the byte width of one interleaved record.
+ *
+ * Internal helper called by sample_capacity(), esp_timeseries_record_i16(),
+ * esp_timeseries_get_status(), and esp_timeseries_get_capture().
+ */
 static size_t record_bytes(void) {
   return recorder_config.channel_count * sizeof(int16_t);
 }
 
+/**
+ * @brief Calculate how many complete records fit in the static buffer.
+ *
+ * Internal helper used during initialization, producer bounds checking, status
+ * reporting, capture publication, and FULL-state detection.
+ */
 static size_t sample_capacity(void) {
   size_t bytes = record_bytes();
   return bytes > 0U ? sizeof(recorder_buffer) / bytes : 0U;
 }
 
+/**
+ * @brief Validate and publish the application-wide recorder configuration.
+ * @see Declaration in esp_timeseries_recorder.h for the public API contract.
+ */
 esp_err_t esp_timeseries_init(const esp_timeseries_config_t *config) {
+  /* Validate top-level limits before accessing channel descriptors. */
   if (config == NULL || config->channels == NULL ||
       config->producer_rate_hz == 0U || config->channel_count == 0U ||
       config->channel_count > CONFIG_ESP_TIMESERIES_RECORDER_MAX_CHANNELS) {
@@ -45,6 +62,8 @@ esp_err_t esp_timeseries_init(const esp_timeseries_config_t *config) {
       ESP_TIMESERIES_STATE_UNINITIALIZED) {
     return ESP_ERR_INVALID_STATE;
   }
+
+  /* Validate the linear transform and strings required for every channel. */
   for (size_t channel = 0; channel < config->channel_count; channel++) {
     if (config->channels[channel].name == NULL ||
         config->channels[channel].unit == NULL ||
@@ -55,11 +74,14 @@ esp_err_t esp_timeseries_init(const esp_timeseries_config_t *config) {
     }
   }
 
+  /* Shallow-copy persistent metadata and verify the static buffer geometry. */
   recorder_config = *config;
   if (sample_capacity() == 0U) {
     recorder_config = (esp_timeseries_config_t){0};
     return ESP_ERR_NO_MEM;
   }
+
+  /* Reset capture metadata before making EMPTY visible to other tasks. */
   memset(saturation_counts, 0, sizeof(saturation_counts));
   memset(invalid_counts, 0, sizeof(invalid_counts));
   atomic_store_explicit(&recorder_sample_count, 0U, memory_order_relaxed);
@@ -68,12 +90,19 @@ esp_err_t esp_timeseries_init(const esp_timeseries_config_t *config) {
   return ESP_OK;
 }
 
+/**
+ * @brief Configure the decimator and atomically arm a new capture.
+ * @see Declaration in esp_timeseries_recorder.h for the public API contract.
+ */
 esp_err_t esp_timeseries_arm(uint32_t sample_rate_hz) {
+  /* Exact integer division guarantees uniform sample spacing. */
   if (sample_rate_hz == 0U ||
       sample_rate_hz > recorder_config.producer_rate_hz ||
       recorder_config.producer_rate_hz % sample_rate_hz != 0U) {
     return ESP_ERR_INVALID_ARG;
   }
+
+  /* Claim EMPTY so a concurrent consumer cannot arm the same buffer twice. */
   int expected = ESP_TIMESERIES_STATE_EMPTY;
   if (!atomic_compare_exchange_strong_explicit(
           &recorder_state, &expected, RECORDER_STATE_CONFIGURING,
@@ -81,6 +110,7 @@ esp_err_t esp_timeseries_arm(uint32_t sample_rate_hz) {
     return ESP_ERR_INVALID_STATE;
   }
 
+  /* Prepare all per-capture state while the private sentinel hides it. */
   recorder_sample_rate_hz = sample_rate_hz;
   recorder_sample_divider = recorder_config.producer_rate_hz / sample_rate_hz;
   recorder_capture_id++;
@@ -89,12 +119,22 @@ esp_err_t esp_timeseries_arm(uint32_t sample_rate_hz) {
   memset(saturation_counts, 0, sizeof(saturation_counts));
   memset(invalid_counts, 0, sizeof(invalid_counts));
   atomic_store_explicit(&recorder_sample_count, 0U, memory_order_relaxed);
+
+  /* Publish the fully configured capture to the producer. */
   atomic_store_explicit(&recorder_state, ESP_TIMESERIES_STATE_ARMED,
                         memory_order_release);
   return ESP_OK;
 }
 
+/**
+ * @brief Decide whether the current producer call must store a record.
+ *
+ * Internal hot-path helper called only by esp_timeseries_record_f32() and
+ * esp_timeseries_record_i16(). It starts an ARMED capture, advances the integer
+ * decimator, and returns the next unpublished buffer index.
+ */
 static bool prepare_record(int64_t timestamp_us, size_t *sample_index) {
+  /* The first call after ARM defines the capture timestamp and starts it. */
   esp_timeseries_state_t state = (esp_timeseries_state_t)atomic_load_explicit(
       &recorder_state, memory_order_acquire);
   if (state == ESP_TIMESERIES_STATE_ARMED) {
@@ -106,26 +146,45 @@ static bool prepare_record(int64_t timestamp_us, size_t *sample_index) {
   if (state != ESP_TIMESERIES_STATE_CAPTURING) {
     return false;
   }
+
+  /* Skip producer calls until the next exact divider boundary. */
   if (producer_calls_until_sample > 0U) {
     producer_calls_until_sample--;
     return false;
   }
   producer_calls_until_sample = recorder_sample_divider - 1U;
+
+  /* The single producer owns this unpublished destination record. */
   *sample_index =
       atomic_load_explicit(&recorder_sample_count, memory_order_relaxed);
   return *sample_index < sample_capacity();
 }
 
+/**
+ * @brief Publish one completed record and transition to FULL when necessary.
+ *
+ * Internal hot-path helper called only by esp_timeseries_record_f32() and
+ * esp_timeseries_record_i16(), after every channel has been written.
+ */
 static void finish_record(size_t sample_index) {
+  /* Release publication prevents consumers from observing a partial record. */
   size_t count = sample_index + 1U;
   atomic_store_explicit(&recorder_sample_count, count, memory_order_release);
+
+  /* FULL freezes the payload until an explicit consumer clear. */
   if (count >= sample_capacity()) {
     atomic_store_explicit(&recorder_state, ESP_TIMESERIES_STATE_FULL,
                           memory_order_release);
   }
 }
 
+/**
+ * @brief Encode physical values and publish a decimated record.
+ * @see Declaration in esp_timeseries_recorder.h for the public API contract.
+ */
 bool esp_timeseries_record_f32(const float *values, int64_t timestamp_us) {
+  /* Reject invalid input and producer calls that fall outside sample instants.
+   */
   if (values == NULL) {
     return false;
   }
@@ -134,6 +193,7 @@ bool esp_timeseries_record_f32(const float *values, int64_t timestamp_us) {
     return false;
   }
 
+  /* Convert each physical value while preserving one invalid sentinel code. */
   size_t base = sample_index * recorder_config.channel_count;
   for (size_t channel = 0; channel < recorder_config.channel_count; channel++) {
     const esp_timeseries_channel_t *descriptor =
@@ -152,11 +212,18 @@ bool esp_timeseries_record_f32(const float *values, int64_t timestamp_us) {
       recorder_buffer[base + channel] = (int16_t)lroundf(encoded);
     }
   }
+
+  /* Publish only after every channel in the record is complete. */
   finish_record(sample_index);
   return true;
 }
 
+/**
+ * @brief Copy encoded values and publish a decimated record.
+ * @see Declaration in esp_timeseries_recorder.h for the public API contract.
+ */
 bool esp_timeseries_record_i16(const int16_t *values, int64_t timestamp_us) {
+  /* Share the same state transition and integer decimator as the float API. */
   if (values == NULL) {
     return false;
   }
@@ -164,6 +231,8 @@ bool esp_timeseries_record_i16(const int16_t *values, int64_t timestamp_us) {
   if (!prepare_record(timestamp_us, &sample_index)) {
     return false;
   }
+
+  /* Copy the complete record, then account for application invalid markers. */
   memcpy(&recorder_buffer[sample_index * recorder_config.channel_count], values,
          record_bytes());
   for (size_t channel = 0; channel < recorder_config.channel_count; channel++) {
@@ -171,18 +240,30 @@ bool esp_timeseries_record_i16(const int16_t *values, int64_t timestamp_us) {
       invalid_counts[channel]++;
     }
   }
+
+  /* Publish only after data and counters are updated. */
   finish_record(sample_index);
   return true;
 }
 
+/**
+ * @brief Return a lock-free view of the current public state.
+ * @see Declaration in esp_timeseries_recorder.h for the public API contract.
+ */
 esp_timeseries_state_t esp_timeseries_get_state(void) {
+  /* Hide the private ARM configuration sentinel from API consumers. */
   int state = atomic_load_explicit(&recorder_state, memory_order_acquire);
   return state == RECORDER_STATE_CONFIGURING
              ? ESP_TIMESERIES_STATE_UNINITIALIZED
              : (esp_timeseries_state_t)state;
 }
 
+/**
+ * @brief Assemble a diagnostic snapshot from static and atomic metadata.
+ * @see Declaration in esp_timeseries_recorder.h for the public API contract.
+ */
 esp_err_t esp_timeseries_get_status(esp_timeseries_status_t *status) {
+  /* Validate the output and reject unpublished configuration. */
   if (status == NULL) {
     return ESP_ERR_INVALID_ARG;
   }
@@ -193,6 +274,7 @@ esp_err_t esp_timeseries_get_status(esp_timeseries_status_t *status) {
     return ESP_ERR_INVALID_STATE;
   }
 
+  /* Copy one self-contained snapshot; active progress is intentionally live. */
   *status = (esp_timeseries_status_t){
       .state = state,
       .producer_rate_hz = recorder_config.producer_rate_hz,
@@ -217,7 +299,12 @@ esp_err_t esp_timeseries_get_status(esp_timeseries_status_t *status) {
   return ESP_OK;
 }
 
+/**
+ * @brief Publish a zero-copy view after the producer has frozen the payload.
+ * @see Declaration in esp_timeseries_recorder.h for the public API contract.
+ */
 esp_err_t esp_timeseries_get_capture(esp_timeseries_capture_t *capture) {
+  /* Only FULL guarantees immutable samples, counters, and capture metadata. */
   if (capture == NULL) {
     return ESP_ERR_INVALID_ARG;
   }
@@ -226,6 +313,7 @@ esp_err_t esp_timeseries_get_capture(esp_timeseries_capture_t *capture) {
     return ESP_ERR_INVALID_STATE;
   }
 
+  /* Acquire the published count before exposing zero-copy pointers. */
   size_t count =
       atomic_load_explicit(&recorder_sample_count, memory_order_acquire);
   *capture = (esp_timeseries_capture_t){
@@ -244,17 +332,29 @@ esp_err_t esp_timeseries_get_capture(esp_timeseries_capture_t *capture) {
   return ESP_OK;
 }
 
+/**
+ * @brief Atomically release a completed capture without erasing its bytes.
+ * @see Declaration in esp_timeseries_recorder.h for the public API contract.
+ */
 esp_err_t esp_timeseries_clear(void) {
+  /* Claim FULL and invalidate all outstanding capture views in one transition.
+   */
   int expected = ESP_TIMESERIES_STATE_FULL;
   if (!atomic_compare_exchange_strong_explicit(
           &recorder_state, &expected, ESP_TIMESERIES_STATE_EMPTY,
           memory_order_acq_rel, memory_order_acquire)) {
     return ESP_ERR_INVALID_STATE;
   }
+
+  /* Reset logical progress; a subsequent ARM may overwrite the old bytes. */
   atomic_store_explicit(&recorder_sample_count, 0U, memory_order_release);
   return ESP_OK;
 }
 
+/**
+ * @brief Convert a state enumeration to its protocol-facing name.
+ * @see Declaration in esp_timeseries_recorder.h for the public API contract.
+ */
 const char *esp_timeseries_state_name(esp_timeseries_state_t state) {
   switch (state) {
   case ESP_TIMESERIES_STATE_UNINITIALIZED:
