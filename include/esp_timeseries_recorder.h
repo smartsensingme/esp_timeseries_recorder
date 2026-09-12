@@ -119,6 +119,10 @@ esp_err_t esp_timeseries_arm(uint32_t sample_rate_hz);
  * prepare_record() and finish_record() helpers. Encoding is
  * round((value-offset)/scale); non-finite values use the reserved code and
  * finite overflow is clamped and counted. The path does not block or allocate.
+ * The function and its private recording helpers execute from IRAM, while the
+ * recorder state and payload buffer reside in internal DRAM. For operation
+ * while the flash cache is disabled, @p values and the channel descriptor
+ * array referenced during float encoding must also reside in internal memory.
  *
  * @param values channel_count physical values in descriptor order.
  * @param timestamp_us Producer timestamp; used only by the first call after
@@ -132,7 +136,10 @@ bool esp_timeseries_record_f32(const float *values, int64_t timestamp_us);
  *
  * Called externally from the single producer loop and uses the same private
  * decimation/publication helpers as esp_timeseries_record_f32(). Values are
- * copied unchanged; reserved invalid values are counted.
+ * copied unchanged; reserved invalid values are counted. The function and its
+ * helpers execute from IRAM and use recorder-owned internal DRAM. For
+ * cache-disabled operation, @p values and the caller's stack must also be in
+ * internal memory.
  *
  * @param values channel_count raw values in descriptor order.
  * @param timestamp_us Producer timestamp; used only by the first call after

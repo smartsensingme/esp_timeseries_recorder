@@ -149,6 +149,23 @@ produtor armazenou um registro. Um retorno `false` é normal quando o gravador
 está vazio, quando a decimação configurada enquanto ele está armado descarta a
 chamada ou quando a captura já está cheia.
 
+### Caminho de gravação com o cache desabilitado
+
+As duas funções de gravação e seus auxiliares privados de decimação/publicação
+executam em IRAM. O estado e os contadores são colocados explicitamente na DRAM
+interna; o grande buffer zerado permanece na BSS interna normal do componente,
+sem aumentar a imagem gravada na flash. A API inteira copia os valores com um
+laço limitado em vez de depender de `memcpy`; a API em ponto flutuante faz o
+arredondamento localmente, sem chamar `lroundf()` residente na Flash.
+
+Isso mantém disponível o lado do componente usado pelo produtor enquanto o
+cache da Flash está desabilitado. A aplicação ainda deve manter o vetor de
+entrada, a pilha da tarefa produtora e toda a cadeia chamadora na memória
+interna. A API em ponto flutuante também acessa os descritores de canal copiados
+por referência; portanto, esse vetor de descritores deve ser interno nessa
+situação. Inicialização, ARM, status, acesso à captura, CLEAR e transporte ficam
+fora dessa garantia.
+
 ## Resumo da API
 
 | Função | Finalidade |

@@ -138,6 +138,22 @@ The return value of a record function says whether that particular producer
 call stored a record; `false` is normal while empty, armed-rate decimation is
 skipping a call, or the capture is full.
 
+### Cache-disabled recording path
+
+Both record functions and their private decimation/publication helpers execute
+from IRAM. Recorder state and counters are explicitly placed in internal DRAM;
+the large zero-initialized capture buffer remains in the component's ordinary
+internal BSS so it does not inflate the application image. The integer API copies values with a
+bounded loop instead of depending on `memcpy`; the float API performs rounding
+locally instead of calling flash-resident `lroundf()`.
+
+This makes the component side of the producer path available while the flash
+cache is disabled. The application must still keep the input array, producer
+task stack, and complete caller chain in internal memory. The float API also
+dereferences the shallow-copied channel descriptors, so that descriptor array
+must be internal in a cache-disabled application. Initialization, ARM, status,
+capture access, CLEAR, and transport operations remain outside this guarantee.
+
 ## API summary
 
 | Function | Role |

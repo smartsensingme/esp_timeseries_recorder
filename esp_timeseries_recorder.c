@@ -1,5 +1,6 @@
 #include "esp_timeseries_recorder.h"
 
+#include "esp_attr.h"
 #include "sdkconfig.h"
 #include <limits.h>
 #include <math.h>
@@ -14,17 +15,21 @@ _Static_assert(RECORDER_BUFFER_BYTES >= sizeof(int16_t),
                "Recorder buffer must hold at least one int16 value");
 
 /* A singleton keeps the large, compile-time-sized DRAM reservation reusable. */
+/* Ordinary zero-initialized component BSS is linked into internal DRAM without
+ * turning this large reservation into bytes stored in the application image. */
 static int16_t recorder_buffer[RECORDER_BUFFER_BYTES / sizeof(int16_t)];
-static uint32_t saturation_counts[CONFIG_ESP_TIMESERIES_RECORDER_MAX_CHANNELS];
-static uint32_t invalid_counts[CONFIG_ESP_TIMESERIES_RECORDER_MAX_CHANNELS];
-static esp_timeseries_config_t recorder_config;
-static atomic_int recorder_state = ESP_TIMESERIES_STATE_UNINITIALIZED;
-static atomic_size_t recorder_sample_count;
-static uint32_t recorder_sample_rate_hz;
-static uint32_t recorder_sample_divider;
-static uint32_t recorder_capture_id;
-static uint32_t producer_calls_until_sample;
-static int64_t recorder_start_time_us;
+static DRAM_ATTR uint32_t
+    saturation_counts[CONFIG_ESP_TIMESERIES_RECORDER_MAX_CHANNELS];
+static DRAM_ATTR uint32_t
+    invalid_counts[CONFIG_ESP_TIMESERIES_RECORDER_MAX_CHANNELS];
+static DRAM_ATTR esp_timeseries_config_t recorder_config;
+static DRAM_ATTR atomic_int recorder_state = ESP_TIMESERIES_STATE_UNINITIALIZED;
+static DRAM_ATTR atomic_size_t recorder_sample_count;
+static DRAM_ATTR uint32_t recorder_sample_rate_hz;
+static DRAM_ATTR uint32_t recorder_sample_divider;
+static DRAM_ATTR uint32_t recorder_capture_id;
+static DRAM_ATTR uint32_t producer_calls_until_sample;
+static DRAM_ATTR int64_t recorder_start_time_us;
 
 /**
  * @brief Calculate the byte width of one interleaved record.
@@ -32,7 +37,7 @@ static int64_t recorder_start_time_us;
  * Internal helper called by sample_capacity(), esp_timeseries_record_i16(),
  * esp_timeseries_get_status(), and esp_timeseries_get_capture().
  */
-static size_t record_bytes(void) {
+static size_t IRAM_ATTR record_bytes(void) {
   return recorder_config.channel_count * sizeof(int16_t);
 }
 
@@ -42,7 +47,7 @@ static size_t record_bytes(void) {
  * Internal helper used during initialization, producer bounds checking, status
  * reporting, capture publication, and FULL-state detection.
  */
-static size_t sample_capacity(void) {
+static size_t IRAM_ATTR sample_capacity(void) {
   size_t bytes = record_bytes();
   return bytes > 0U ? sizeof(recorder_buffer) / bytes : 0U;
 }
@@ -133,7 +138,8 @@ esp_err_t esp_timeseries_arm(uint32_t sample_rate_hz) {
  * esp_timeseries_record_i16(). It starts an ARMED capture, advances the integer
  * decimator, and returns the next unpublished buffer index.
  */
-static bool prepare_record(int64_t timestamp_us, size_t *sample_index) {
+static bool IRAM_ATTR prepare_record(int64_t timestamp_us,
+                                     size_t *sample_index) {
   /* The first call after ARM defines the capture timestamp and starts it. */
   esp_timeseries_state_t state = (esp_timeseries_state_t)atomic_load_explicit(
       &recorder_state, memory_order_acquire);
@@ -166,7 +172,7 @@ static bool prepare_record(int64_t timestamp_us, size_t *sample_index) {
  * Internal hot-path helper called only by esp_timeseries_record_f32() and
  * esp_timeseries_record_i16(), after every channel has been written.
  */
-static void finish_record(size_t sample_index) {
+static void IRAM_ATTR finish_record(size_t sample_index) {
   /* Release publication prevents consumers from observing a partial record. */
   size_t count = sample_index + 1U;
   atomic_store_explicit(&recorder_sample_count, count, memory_order_release);
@@ -182,7 +188,8 @@ static void finish_record(size_t sample_index) {
  * @brief Encode physical values and publish a decimated record.
  * @see Declaration in esp_timeseries_recorder.h for the public API contract.
  */
-bool esp_timeseries_record_f32(const float *values, int64_t timestamp_us) {
+bool IRAM_ATTR esp_timeseries_record_f32(const float *values,
+                                         int64_t timestamp_us) {
   /* Reject invalid input and producer calls that fall outside sample instants.
    */
   if (values == NULL) {
@@ -209,7 +216,9 @@ bool esp_timeseries_record_f32(const float *values, int64_t timestamp_us) {
       recorder_buffer[base + channel] = INT16_MIN + 1;
       saturation_counts[channel]++;
     } else {
-      recorder_buffer[base + channel] = (int16_t)lroundf(encoded);
+      /* Round halfway away from zero without calling flash-resident libm. */
+      recorder_buffer[base + channel] =
+          (int16_t)(encoded >= 0.0f ? encoded + 0.5f : encoded - 0.5f);
     }
   }
 
@@ -222,7 +231,8 @@ bool esp_timeseries_record_f32(const float *values, int64_t timestamp_us) {
  * @brief Copy encoded values and publish a decimated record.
  * @see Declaration in esp_timeseries_recorder.h for the public API contract.
  */
-bool esp_timeseries_record_i16(const int16_t *values, int64_t timestamp_us) {
+bool IRAM_ATTR esp_timeseries_record_i16(const int16_t *values,
+                                         int64_t timestamp_us) {
   /* Share the same state transition and integer decimator as the float API. */
   if (values == NULL) {
     return false;
@@ -232,10 +242,10 @@ bool esp_timeseries_record_i16(const int16_t *values, int64_t timestamp_us) {
     return false;
   }
 
-  /* Copy the complete record, then account for application invalid markers. */
-  memcpy(&recorder_buffer[sample_index * recorder_config.channel_count], values,
-         record_bytes());
+  /* Copy explicitly so the hot path has no dependency on a libc call. */
+  size_t base = sample_index * recorder_config.channel_count;
   for (size_t channel = 0; channel < recorder_config.channel_count; channel++) {
+    recorder_buffer[base + channel] = values[channel];
     if (values[channel] == ESP_TIMESERIES_INVALID_I16) {
       invalid_counts[channel]++;
     }
